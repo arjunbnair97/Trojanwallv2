@@ -1,0 +1,163 @@
+#Test Pipeline 46
+
+stages:
+  - build and test
+  - trigger
+  - infra build
+  - deploy production
+  - test and cleanup
+
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - node_modules/  
+
+
+variables:
+  STAGING_DOMAIN: staging.trojanwallv2.surge.sh # URL to Staging environment.
+
+
+build website:
+  image: node
+  stage: build and test 
+  script:
+    - npm install
+    - npm i python3
+
+    - mkdir .public
+    - cp -R .dockerignore .public
+    - cp -rPp * .public
+    - mv .public public
+  allow_failure: false
+
+  artifacts:
+    paths:
+      - public
+    expire_in: 3 weeks
+    when: on_success
+      
+test artifact:
+  stage: build and test
+  extends: build website
+  script:
+    - mkdir .public
+    - cp -R .dockerignore .public
+    - cp -rPp * .public
+    - mv .public public
+    - grep -q "$APP_YEAR_VERSION Trojan Wall v$DOCKER_IMAGE_VERSION . All Rights Reserved" ./public/templates/home.html
+  when: delayed
+  start_in: 1 minutes
+  allow_failure: true
+
+
+deploy trigger:
+  stage: trigger
+  script:
+    - echo "Deployment Triggered"
+  only:
+    - Production 
+  when: manual
+  allow_failure: false
+
+
+terraform build:
+  stage: infra build
+  trigger:
+    include:
+    - project: 'arbnair97/trojanwall-terraform'
+      ref: master
+      file: '.gitlab-ci.yml'   
+  only:
+    - Production
+  when: on_success
+
+
+docker image build:
+  image: docker:19.03.6
+  variables: 
+    DOCKER_TLS_CERTDIR: "/certs"
+  stage: infra build
+  only:
+    - Production 
+  services:
+  - docker:19.03.6-dind
+  before_script:
+    - chmod 777 -R ./public
+    - docker info
+    - docker --version
+  script:
+    - sleep 120
+    - cd ./public
+    - docker build -f .dockerignore -t $DOCKER_REPO:v$DOCKER_IMAGE_VERSION .
+    - docker images
+    - docker login -u $DOCKER_USER -p $DOCKER_USER_PASSWORD
+    - docker push $DOCKER_REPO:v$DOCKER_IMAGE_VERSION 
+  environment:
+    name: production
+  when: on_success
+
+
+deploy production:
+  image: node
+  stage: deploy production
+  extends: docker image build
+  only:
+    - Production 
+  before_script:
+    - mkdir -p ~/.ssh
+#    - echo -e "$PROD_SSH_PRIVATE_KEY" > ~/.ssh/id_rsa # When using Direct deployment to server
+    - echo -e "$ANSIBLE_ENGINE_KEY" > ~/.ssh/id_rsa
+#    - echo -e "$ANSADMIN_KEY" > ~/.ssh/id_rsa
+    - chmod 600  ~/.ssh/id_rsa
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+
+  script:
+#     - bash GitLab/ec2-deploy.sh
+#     - bash GitLab/gitlab-deploy.prod.sh
+     - bash GitLab/ansible-engine-K8s-deploy.sh # To deploy to Kubernetes Cluster in server using Ansible Engine
+#     - bash GitLab/k8s-deploy.sh # To derectly deploy to Kubernetes Cluster in server
+     - echo "Deployment to Kubernetes Cluster Completed"
+  when: on_success
+  allow_failure: false
+  environment:
+     name: production
+  retry: 2
+ 
+
+production test:
+  image: node
+  stage: test and cleanup
+  before_script:
+    - mkdir -p ~/.ssh
+    - echo -e "$ANSIBLE_ENGINE_KEY" > ~/.ssh/id_rsa
+#    - echo -e "$PROD_SSH_PRIVATE_KEY" > ~/.ssh/id_rsa # When using Direct deployment to server
+    - chmod 600  ~/.ssh/id_rsa
+    - '[[ -f /.dockerenv ]] && echo -e "Host *\n\tStrictHostKeyChecking no\n\n" > ~/.ssh/config'
+
+  script:
+    - bash GitLab/k8s-ansible-test.sh
+#    - bash GitLab/k8s-test.sh # Used when deploying directly to server
+    - echo "Testing in Production Kubernetes cluster in production environment successfull"
+    - echo "Deployment process complete"
+  retry: 2
+  only:
+    - Production 
+  when: on_success
+  allow_failure: true
+
+
+terraform destroy:
+  stage: test and cleanup
+  trigger:
+    include:
+    - project: 'arbnair97/trojanwall-terraform'
+      ref: master
+      file: 'destroy.gitlab-ci.yml'   
+  only:
+    - Production
+#  when: manual
+
+
+
+
